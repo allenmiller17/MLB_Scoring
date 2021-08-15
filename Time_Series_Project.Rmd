@@ -1,0 +1,754 @@
+---
+title: "Final MLB Score Prediction"
+author: "Allen Miller"
+date: "7/14/2021"
+output:
+  html_document:
+    df_print: paged
+df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Librarys, error=FALSE, warning=FALSE, include=FALSE, results='hide', tidy=TRUE}
+#Read in libraries
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(tswge)
+library(GGally)
+library(nnfor)
+library(vars)
+```
+
+# EDA
+This is a dataset of MLB statistics from before 1900. I will analyze the average daily home team score of all MLB teams from the year 2006 to 2016. 
+The date was not in a usable format so it was converted to YYYY-mm-dd.
+I decided to keep attendance, home team homerun, and home team strikeout data to analyze in conjunction with home team score.
+There were 2 missing values in the attendance data for the selected time period. After researching I found that these 2 games had no fans due to civil unrest so they were imputed with 0.
+No other missing values were found in the rest of the data.
+
+I finally took the daily average for attendance, homeruns, and strikeouts so they coordinated with the average scores.
+
+```{r Data Cleaning, error=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE, tidy=TRUE}
+#Read in MLB Data set
+MLB <- read.csv("/Users/allenmiller/OneDrive - Southern Methodist University/Time Series/MLB_Stats.csv")
+
+#view data
+MLB
+#summary(MLB)
+
+#Convert Date to usable format so we can decide what data we may want to use
+MLB$date <- as.character(MLB$date)
+MLB$date <- as.Date(MLB$date, format = "%Y%m%d")
+#str(MLB$date)
+
+
+temp_analysis <- filter(MLB, date > "2006-01-01")
+temp_analysis <- filter(temp_analysis, date < "2006-12-31")
+length(temp_analysis$date)
+uniqueAnalysis <- unique(temp_analysis$date)
+length(uniqueAnalysis) #180 Games in a season (counts regular season and postseason) 
+
+
+#Look at the end of the dataset to determine a good date range
+#Going to analyze 10 years of data (2007 season - 2016 season)
+tail(MLB)
+new_mlb <- filter(MLB, date > "2006-01-01")
+
+#Due to Civil unrest there were games played without fans - updated from NA to 0 attendance
+filter(new_mlb,is.na(attendance))
+new_mlb$attendance[is.na(new_mlb$attendance)] <- 0
+filter(new_mlb,is.na(attendance))
+
+#Check for NA on Homeruns
+filter(new_mlb,is.na(h_homeruns))
+
+new_mlb
+#summary(new_mlb)
+
+#Create a temp df for average attendance grouping by the day
+tempMLB1 <- new_mlb %>% group_by(date) %>% summarise(avgAttend = mean(attendance))
+
+
+#Create a temp df for average Homeruns grouping by the day
+tempMLB2 <- new_mlb %>% group_by(date) %>% summarise(h_avgHomerun = mean(h_homeruns))
+
+
+#Merge into final dataframe to use for analysis
+Final <- merge(tempMLB1,tempMLB2, by="date")
+sum(is.na(Final$avgAttend))
+sum(is.na(Final$h_avgHomerun))
+Final
+
+tempMLB3 <- new_mlb %>% group_by(date) %>% summarise(h_avgScore = mean(h_score))
+tempMLB3
+Final <- merge(Final, tempMLB3, by="date")
+sum(is.na(Final$h_avgScore))
+
+
+
+tempMLB4 <- new_mlb %>% group_by(date) %>% summarise(h_avgStrikeouts = mean(h_strikeouts))
+
+Final <- merge(Final, tempMLB4, by="date")
+
+Final
+```
+
+# Look at plots and analyze data
+I plotted the response (Average Home Daily Score), and the 3 selected features (Average Home Daily Strikeouts, Average Home Team Daily Homeruns, and Average Home Daily Attendance). I was first looking to for white noise and seasonal behavior in the autocorrelations for each. All appear to have at least some cyclical behavior leading me to believe that they all contain at least some seasonality. The Average Home Score, and Average Home Homeruns could be considered white noise, however, enough of the lags fall outside of the 95% confidence limits, I decided to treat them as if they had correlation that needed to be modeled out.
+
+Finally I created a pairs plot which shows how each of the variables relate to the response. I ultimately decided to remove Average Home Attendance from the analysis as it didn't appear to correlate with Average Home Score.
+
+```{r Initial Plot Analysis, error=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE, tidy=TRUE,include=TRUE, results='hide'}
+#Plot Variables to look for correlation
+plotts.sample.wge(Final$h_avgScore, arlimits = T)
+plotts.sample.wge(Final$h_avgStrikeouts, arlimits = T)
+plotts.sample.wge(Final$h_avgHomerun, arlimits = T)
+plotts.sample.wge(Final$avgAttend, arlimits = T)
+
+ggpairs(Final)
+```
+
+# Look at average score and forecast
+The first model I created was a univariate model containing only the Average Home Daily Score modeled over time. The model performed relatively similar in predicting short-term (15 games) and long-term (75 games) with an ASE of 2.336823 and 2.075489 respectively. Overall the model had a rolling window ASE of 1.670088. Visually we can see that both horizons provide areas where the model performed well and others where it did not.
+
+```{r Avg Score Analysis, error=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE, tidy=TRUE,include=TRUE, results='hide'}
+#Average Score Analysis
+est.arma.wge(Final$h_avgScore, p =15) #Appears to be seasonal data S=180 (Baseball season length)
+scoreDif <- artrans.wge(Final$h_avgScore, phi.tr = c(rep(0,179),1))
+
+plotts.sample.wge(scoreDif, arlimits = T)
+
+aic5.wge(scoreDif, p=0:10)#5,2
+aic5.wge(scoreDif,p=0:10, type = "bic") #1,0
+#Choose 3,1 since it appears in the top 5 of AIC and BIC
+
+ljung.wge(scoreDif,p=3, q=1) #p-value = 0.0004006629
+ljung.wge(scoreDif, p=3, q=1, K=48) #p-value = 8.199668e-06
+acf(scoreDif, lag.max = 48) #Some evidence that all the variance is not white noise, will proceed with analysis still
+
+scoreEst <- est.arma.wge(scoreDif, p=3, q=1)
+scoreEst$aic #0.5545083
+scoreEst$phi #1.03594207 -0.01769287 -0.02592206
+scoreEst$theta #0.9791195
+scoreEst$avar #1.731465
+univariate <- scoreEst$aic #0.5545083
+mean(Final$h_avgScore) #4.519875
+
+
+fit <- fore.aruma.wge(Final$h_avgScore, phi = scoreEst$phi, theta = scoreEst$theta, s=180, n.ahead = 15, lastn = T, limits = F)
+
+
+fitLong <- fore.aruma.wge(Final$h_avgScore, phi = scoreEst$phi, theta = scoreEst$theta, s=180, n.ahead = 75, lastn = T, limits = F)
+
+#Find ASE 15 Games
+ASE1 <- mean((Final$h_avgScore[1971:1985]-fit$f)^2)
+ASE1 #2.336823
+
+#Plot the Real Last 15 vs the Predicted Last 15
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1971,1985,1),fit$f), color = "red") + xlim(1900,1995)+ labs(title = "Last 15 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+#Find ASE 75 Games
+ASE1Long <- mean((Final$h_avgScore[1971:1985]-fitLong$f)^2)
+ASE1Long #2.075489
+
+#Plot the Real Last 75 vs the Predicted Last 15
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1911,1985,1),fitLong$f), color = "red") + xlim(1900,1995)+ labs(title = "Last 75 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+#Rolling Window ASE
+training_size = 15
+horizon1 = 15
+ASEHolder=numeric()
+
+for(i in 1:(length(Final$h_avgScore)-(training_size + horizon1) + 1))
+{
+  ASE1.1 = mean((Final$h_avgScore[(training_size+i):(training_size+i+(horizon1)-1)]-fit$f)^2)
+  
+  ASEHolder[i] = ASE1.1
+  if(i == length(Final$h_avgScore))
+  {
+    print(fit$f)
+  }
+  
+}
+ASEHolder
+hist(ASEHolder)
+WindowedASE1= mean(ASEHolder)
+WindowedASE1 # 1.670088
+
+
+#Predict and Plot for 10 Games
+predsSC_10 <- fore.aruma.wge(Final$h_avgScore, phi = scoreEst$phi, theta = scoreEst$theta, s=180, n.ahead = 10, limits = F)
+plot(predsSC_10$f, type = "l")
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1986,1995,1),predsSC_10$f), color = "red") + xlim(1900,1995)+ labs(title = "Next 10 Games Score Forecast", y="Average Score", x="Number of Games")
+
+
+#Predict and Plot for 100 Games
+predsSC_100 <- fore.aruma.wge(Final$h_avgScore, phi = scoreEst$phi, theta = scoreEst$theta, s= 180, n.ahead = 100)
+plot(predsSC_100$f, type = "l")
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1986,2085,1),predsSC_100$f), color = "red") + xlim(1900,2085)+ labs(title = "Next 100 Games Score Forecast", y="Average Score", x="Number of Games")
+```
+
+
+# Look at homeruns and forecast
+I next forecasted the Average Home Team Daily Homeruns. These forecasts were used later when modeling multivariate ARIMA models
+
+```{r Avg Homerun Analysis, error=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE, tidy=TRUE,include=TRUE, results='hide'}
+#Forecast Average Homeruns
+est.arma.wge(Final$h_avgHomerun, p=15)
+homerunDif <- artrans.wge(Final$h_avgHomerun, phi.tr = c(rep(0,179),1))
+plotts.sample.wge(homerunDif, arlimits = T)
+
+aic5.wge(homerunDif, p=0:10)#2,2
+aic5.wge(homerunDif,p=0:10, type = "bic") #1,1
+#Choose 2,2
+
+ljung.wge(homerunDif,p=2, q=2) #p-value = 3.653744e-13
+ljung.wge(homerunDif, p=2, q=2, K=48) #p-value = 0
+acf(homerunDif, lag.max = 48) #Some evidence that all the variance is not white noise, will proceed with analysis still
+
+homerunEst <- est.arma.wge(homerunDif, p=2, q=2)
+homerunEst$phi #0.4060225 0.5841938
+homerunEst$theta #0.4247194 0.5337479
+homerunEst$avar #0.1972391
+mean(Final$h_avgHomerun) #1.013821
+
+#Predict and Plot for 10 Games
+predsHR_10 <- fore.aruma.wge(Final$h_avgHomerun, phi = homerunEst$phi, theta = homerunEst$theta, s=180, n.ahead = 10, limits = F)
+plot(predsHR_10$f, type = "l")
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgHomerun)) + geom_line(aes(seq(1986,1995,1),predsHR_10$f), color = "red") + xlim(1900,1995)+ labs(title = "Next 10 Games Homerun Forecast", y="Average Homeruns", x="Number of Games")
+
+
+#Predict and Plot for 100 Games
+predsHR_100 <- fore.aruma.wge(Final$h_avgHomerun, phi = homerunEst$phi, theta = homerunEst$theta, s= 180, n.ahead = 100)
+plot(predsHR_100$f, type = "l")
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgHomerun)) + geom_line(aes(seq(1986,2085,1),predsHR_100$f), color = "red") + xlim(1900,2085)+ labs(title = "Next 100 Games Homerun Forecast", y="Average Homeruns", x="Number of Games")
+```
+
+
+# Look at Strikeouts and forecast
+I next forecasted the Average Home Daily Strikeouts. These forecasts were used later when modeling multivariate ARIMA models
+
+```{r Avg Strikeout Analysis, error=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE, tidy=TRUE,include=TRUE, results='hide'}
+#Forecast Average Strikeouts
+est.arma.wge(Final$h_avgStrikeouts, p = 15) #Difference of 2
+
+
+soDif <- artrans.wge(Final$h_avgStrikeouts, phi.tr= c(rep(0,179),1))
+plotts.sample.wge(soDif, arlimits = T)
+aic5.wge(soDif,)#0,1
+aic5.wge(soDif, type = "bic") #0,0
+#Choose 0,1
+
+ljung.wge(soDif, p=0, q=1) #p-value = 0.09844763
+ljung.wge(soDif, p=0, q=1, K=48) #p-value = 0.1076278
+acf(soDif, lag.max = 48)
+
+estSO <- est.arma.wge(soDif, p=0, q=1)
+estSO$theta #-0.0574414
+estSO$avar #1.463236
+mean(Final$h_avgStrikeouts)#6.911719
+
+
+#Predict and Plot for 10 Games
+predsSO_10 <- fore.aruma.wge(Final$h_avgStrikeouts,estSO$theta, s=180, n.ahead = 10, limits = F)
+plot(predsSO_10$f, type = "l")
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgStrikeouts)) + geom_line(aes(seq(1986,1995,1),predsSO_10$f), color = "red") + xlim(1900,1995)+ labs(title = "Next 10 Games Strikeouts Forecast", y="Average Strikeouts", x="Number of Games")
+
+
+#Predict and Plot for 100 Games
+predsSO_100 <- fore.aruma.wge(Final$h_avgStrikeouts,estSO$theta, s=180, n.ahead = 100, limits = F)
+plot(predsSO_100$f, type = "l")
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgStrikeouts)) + geom_line(aes(seq(1986,2085,1),predsSO_100$f), color = "red") + xlim(1900,2085)+ labs(title = "Next 100 Games Strikeout Forecast", y="Average Strikeouts", x="Number of Games")
+```
+
+
+# Finding P,Q without AIC5
+The first ARIMA model I did was run without using the aic5.wge() function and instead looking at the aic.wge() function to obtain my p and q for the model. I decided that there was some seasonality in the variables and used a period of 180 to model this as it seemed to repeat at the start of every season. An ARIMA(1,0,1) S=180 was selected and after looking at the autocorrelations of the residuals and conducting a hypothesis test, it appears that the remaining variance in the model can be explained by white noise (p-value=0.19154).
+
+Short-term this model performed significantly better than the univariate model with an ASE of 0.7744981 while overall it performed slightly better with a Rolling Window ASE of 1.209784. There does appear to be room for improvement based off the ASE plots, however the 10 and 100 game forecasts appear to give realistic values for future scores.
+
+```{r ARMA Run 1, error=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE, tidy=TRUE,include=TRUE, results='hide'}
+t <- 1:1985
+rollback <- Final
+Final$t <- t
+Final1 <- Final[0: 1970,]
+
+#Fit ARIMA Model 1
+#Leaving out time to see if it is useful later
+ksfit.1 <- lm(Final$h_avgScore~Final$h_avgHomerun+Final$h_avgStrikeouts)
+phi.1=aic.wge(ksfit.1$residuals)
+phi.1 #p= 1 q = 1
+
+fit.1 <- arima(Final$h_avgScore, order = c(phi.1$p,0,phi.1$q), seasonal = list(order = c(0,1,0), period = 180),  xreg = cbind(Final$h_avgHomerun,Final$h_avgStrikeouts))
+print(fit.1)
+AIC(fit.1) #5498.95
+
+#Look at Residuals for White Noise
+plotts.sample.wge(fit.1$residuals, arlimits = T)
+ljung.wge(fit.1$residuals, p = 1, q = 1) #p-value = 0.19154
+
+#Find ASE
+preds1 <- predict(fit.1, newxreg = cbind(Final$h_avgHomerun[1971:1985], Final$h_avgStrikeouts[1971:1985]))
+ASE1.1 <- mean((Final$h_avgScore[1971:1985]-preds1$pred)^2)
+ASE1.1 #0.7744981
+
+#Plot the Real Last 15 vs the Predicted Last 15
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1971,1985,1),preds1$pred), color = "red") + xlim(1900,1995)+ labs(title = "Last 15 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+#Find ASE Last 75
+preds1Long <- predict(fit.1, newxreg = cbind(Final$h_avgHomerun[1911:1985],Final$h_avgStrikeouts[1911:1985]))
+ASE1.1Long <- mean((Final$h_avgScore[1911:1985]-preds1Long$pred)^2)
+ASE1.1Long #0.5674416
+
+#Plot the Real Last 75 vs the Predicted Last 75
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1911,1985,1),preds1Long$pred), color = "red") + xlim(1900,1985)+ labs(title = "Last 75 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+
+#Rolling Window ASE
+training_size = 15
+horizon1 = 15
+ASEHolder=numeric()
+
+for(i in 1:(length(Final$h_avgScore)-(training_size + horizon1) + 1))
+{
+  ASE1.1 = mean((Final$h_avgScore[(training_size+i):(training_size+i+(horizon1)-1)]-preds1$pred)^2)
+  
+  ASEHolder[i] = ASE1.1
+  if(i == length(Final$h_avgScore))
+  {
+    print(fit$f)
+  }
+  
+}
+ASEHolder
+hist(ASEHolder)
+WindowedASE1.1= mean(ASEHolder)
+WindowedASE1.1 # 1.209784
+
+
+#Predict Next 10 Games
+  
+next10 <- data.frame(hr = predsHR_10$f, so = predsSO_10$f)
+pred10.1 <- predict(fit.1, newxreg = next10)
+pred10.1
+plot(pred10.1$pred, type = "l", ylab="Predicted Avg Home Team Runs Scored", main = "Next 10 Games")
+  
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1986,1995,1),pred10.1$pred), color = "red") + xlim(1900,1995)+ labs(title = "Next 10 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+
+
+#Predict Next 100 Games
+next100 <- data.frame(hr = predsHR_100$f, so = predsSO_10$f)
+pred100.1 <- predict(fit.1, newxreg = next100)
+pred100.1
+plot(pred100.1$pred, type = "l", ylab="Predicted Avg Home Team Runs Scored", main = "Next 100 Games")
+  
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1986,2085,1),pred100.1$pred), color = "red") + xlim(1900,2085) + labs(title = "Next 100 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+```
+
+
+# Using AIC5 to find P,Q
+Next I used the aic5.wge() function to select p and q for the ARIMA model. Like above an ARIMA(1,0,1) S=180 was selected with identical results as above.
+
+```{r ARMA Run 2, error=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE, tidy=TRUE,include=TRUE, results='hide'}
+aic5.wge(ksfit.1$residuals) #1,1
+aic5.wge(ksfit.1$residuals, type = "bic") #1,1
+fit1.2 <- Arima(Final$h_avgScore, order = c(1,0,1), seasonal = list(order = c(0,1,0), period = 180), xreg = cbind(Final$h_avgHomerun,Final$h_avgStrikeouts))
+fit1.2
+arima_no_time <- AIC(fit1.2) #5,498.95
+
+#Look at Residuals for White Noise
+plotts.sample.wge(fit1.2$residuals, arlimits = T)
+ljung.wge(fit1.2$residuals, p=1, q=1) #p-value = 0.19154
+ljung.wge(fit1.2$residuals, p=1,q=1, K=48) #p-value = 0.05275821
+
+#Find ASE Last 15
+preds1.2 <- predict(fit1.2, newxreg = cbind(Final$h_avgHomerun[1971:1985],Final$h_avgStrikeouts[1971:1985]))
+ASE1.2 <- mean((Final$h_avgScore[1971:1985]-preds1.2$pred)^2)
+ASE1.2 #0.7744981
+
+#Plot the Real Last 15 vs the Predicted Last 15
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1971,1985,1),preds1.2$pred), color = "red") + xlim(1900,1985)+ labs(title = "Last 15 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+
+#Find ASE Last 75
+preds1.2Long <- predict(fit1.2, newxreg = cbind(Final$h_avgHomerun[1911:1985],Final$h_avgStrikeouts[1911:1985]))
+ASE1.2Long <- mean((Final$h_avgScore[1911:1985]-preds1.2Long$pred)^2)
+ASE1.2Long #0.5674416
+
+#Plot the Real Last 75 vs the Predicted Last 75
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1911,1985,1),preds1.2Long$pred), color = "red") + xlim(1900,1985)+ labs(title = "Last 75 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+
+#Rolling Window ASE
+training_size = 15
+horizon1 = 15
+ASEHolder1.2=numeric()
+
+for(i in 1:(length(Final$h_avgScore)-(training_size + horizon1) + 1))
+{
+  ASE1.2 = mean((Final$h_avgScore[(training_size+i):(training_size+i+(horizon1)-1)]-preds1.2$pred)^2)
+  
+  ASEHolder1.2[i] = ASE1.2
+  if(i == length(Final$h_avgScore))
+  {
+    print(preds1.2$pred)
+  }
+  
+}
+hist(ASEHolder1.2)
+WindowedASE1.2= mean(ASEHolder1.2)
+WindowedASE1.2 # 1.209784
+
+
+#Predict Next 10 Games
+pred10.1.2 <- forecast(fit1.2, xreg = cbind(predsHR_10$f,predsSO_10$f),h = 10)
+plot(pred10.1.2$mean, type = "l", ylab="Predicted Average Home Team Runs Scored", main = "Next 10 Games")
+  
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + 
+  geom_ribbon(aes(seq(1986,1995,1),pred10.1.2$mean, ymin =pred10.1.2$lower[,2], ymax = pred10.1.2$upper[,2])) +
+  geom_line(aes(seq(1986,1995,1),pred10.1.2$mean), color = "red") + xlim(1900,1995)+ labs(title = "Next 10 Games Home Team Runs Scored Forecast with 95% prediction limit", y="Average Home Team Runs Scored", x="Number of Games")
+
+
+
+#Predict Next 100 Games
+pred100.1.2 <- forecast(fit1.2, xreg = cbind(predsHR_100$f,predsSO_100$f),h = 100)
+plot(pred100.1.2$mean, type = "l", ylab="Predicted Average Home Team Runs Scored", main = "Next 100 Games")
+  
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) +
+  geom_ribbon(aes(seq(1986,2085,1),pred100.1.2$mean, ymin =pred100.1.2$lower[,2], ymax = pred100.1.2$upper[,2])) + 
+  geom_line(aes(seq(1986,2085,1),pred100.1.2$mean), color = "red") +
+  xlim(1900,2085) + labs(title = "Next 100 Games Home Team Runs Scored Forecast with 95% prediction limit", y="Average Home Team Runs Scored", x="Number of Games")
+
+```
+
+
+# Add in Time component Using AIC5
+My final ARIMA model came by adding time as a predictor. For this aic5.wge() selected ARIMA(0,0,1) S=180 as the model. When testing the residuals for white noise, there is evidence to suggest that the remaining variance in the model can be explained by white noise. This model only performed marginally better than the ARIMA(1,0,1) with short-term, long-term of 0.7698365 and 1.010008 respectfully, while it did not perform as well for the Rolling Window ASE 1.213587. Given that the performance is so close between the 2 I will select the ARIMA(1,0,1) S=180 model as my winner ARIMA model given that it has one less predictor in the model making it ever so slightly simpler.
+
+```{r ARMA plus Time, error=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE, tidy=TRUE,include=TRUE, results='hide'}
+
+ksfit.1.3 <- lm(Final$h_avgScore~Final$h_avgHomerun + Final$h_avgStrikeouts + Final$t)
+aic5.wge(ksfit.1.3$residuals) #0,1
+aic5.wge(ksfit.1.3$residuals, type = "bic") #0,0
+fit1.3 <- arima(Final$h_avgScore, order = c(0,0,1), seasonal = list(order=c(0,1,0), period = 180) , xreg = cbind(Final$h_avgHomerun,Final$h_avgStrikeouts,Final$t))
+fit1.3
+arima_time <- AIC(fit1.3) #5,496.56
+
+#Look at Residuals for White Noise
+plotts.sample.wge(fit1.3$residuals, arlimits = T)
+ljung.wge(fit1.3$residuals, p = 0, q=1) #p-value = 0.2185799
+ljung.wge(fit1.3$residuals, p = 0, q=1, K=48) #p-value = 0.05801664
+
+#Find ASE Last 15
+preds1.3 <- predict(fit1.3, newxreg = cbind(Final$h_avgHomerun[1971:1985],Final$h_avgStrikeouts[1971:1985],Final$t[1971:1985]))
+ASE1.3 <- mean((Final$h_avgScore[1971:1985]-preds1.3$pred)^2)
+ASE1.3 #0.7698365
+
+#Plot the Real Last 15 vs the Predicted Last 15
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1971,1985,1),preds1.3$pred), color = "red") + xlim(1900,1995)+ labs(title = "Last 15 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+#Find ASE Last 75
+preds1.3Long <- predict(fit1.3, newxreg = cbind(Final$h_avgHomerun[1911:1985],Final$h_avgStrikeouts[1911:1985],Final$t[1911:1985]))
+ASE1.3Long <- mean((Final$h_avgScore[1911:1985]-preds1.3Long$pred)^2)
+ASE1.3Long #0.5657957
+
+#Plot the Real Last 75 vs the Predicted Last 75
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1911,1985,1),preds1.3Long$pred), color = "red") + xlim(1900,1985)+ labs(title = "Last 75 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+#Rolling Window ASE
+training_size = 15
+horizon1 = 15
+ASEHolder1.3=numeric()
+
+for(i in 1:(length(Final$h_avgScore)-(training_size + horizon1) + 1))
+{
+  ASE1.3 = mean((Final$h_avgScore[(training_size+i):(training_size+i+(horizon1)-1)]-preds1.3$pred)^2)
+  
+  ASEHolder1.3[i] = ASE1.3
+  if(i == length(Final$h_avgScore))
+  {
+    print(preds1.3$pred)
+  }
+  
+}
+hist(ASEHolder1.3)
+WindowedASE1.3= mean(ASEHolder1.3)
+WindowedASE1.3 # 1.213587
+
+
+#Predict Next 10 Games
+  
+next10 <- data.frame(hr = predsHR_10$f, so= predsSO_10$f, time = seq(1986,1995,1))
+pred10.1.3 <- predict(fit1.3, newxreg = next10)
+pred10.1.3
+plot(pred10.1.3$pred, type = "l", ylab="Predicted Average Home Team Runs Scored", main = "Next 10 Games")
+  
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1986,1995,1),pred10.1.3$pred), color = "red") + xlim(1900,1995)+ labs(title = "Next 10 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+
+
+#Predict Next 100 Games
+next100 <- data.frame(hr = predsHR_100$f, so= predsSO_100$f, time = seq(1986,2085,1))
+pred100.1.3 <- predict(fit1.3, newxreg = next100)
+pred100.1.3
+plot(pred100.1.3$pred, type = "l", ylab="Predicted Average Home Team Runs Scored", main = "Next 100 Games")
+  
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1986,2085,1),pred100.1.3$pred), color = "red") + xlim(1900,2085) + labs(title = "Next 100 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+```
+
+# Table Showing ASE of different ARIMA Models
+
+```{r ARIMA ASE Table, message=FALSE, warning=FALSE, paged.print=TRUE}
+ARIMA_Table <- matrix(c(ASE1, ASE1Long, WindowedASE1, ASE1.1, ASE1.1Long, WindowedASE1.1, ASE1.2, ASE1.2Long, WindowedASE1.2, ASE1.3, ASE1.3Long, WindowedASE1.3),ncol=3, byrow=T)
+colnames(ARIMA_Table) <- c("15 Game ASE", "75 Game ASE", "Rolling Window ASE")
+rownames(ARIMA_Table) <- c("Univariate ", "Multivariate w/o aic5 ", "Multivariate with aic5", "Multivariate with time")
+ARIMA_Table <- as.data.frame(ARIMA_Table)
+ARIMA_Table
+```
+
+
+
+
+# Create a VAR model
+The next type of model I tried was a VAR model. This model did not provide the results I was expecting as it could only forecast the mean of the realization (about 4.3). I first used the VARselect() function to determine the best p which was 2. I then created 3 models one for future forecasts, one for 15 Game ASE, and one for 75 Game ASE. These results were mixed as the models predicted the mean of the realization. This gave respectable ASE scores, but didn't leave me feeling satisfied that this was the best model for this data.
+
+```{r VAR Run 1, error=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE, tidy=TRUE,include=TRUE, results='hide'}
+#Use VARSELECT to initiate VAR model
+VARselect(cbind( score=Final$h_avgScore, hr=Final$h_avgHomerun, so=Final$h_avgStrikeouts), type = "both",) #AIC Picks 2 (-2.86710483)
+varfit <- VAR(cbind( score=Final$h_avgScore, hr=Final$h_avgHomerun, so=Final$h_avgStrikeouts), p=2)
+var_aic <- AIC(varfit) # 11019.28
+
+#Find ASE Last 15
+ASE15_Var_Fit <- VAR(cbind(score=Final$h_avgScore[1971:1985], hr=Final$h_avgHomerun[1971:1985], so=Final$h_avgStrikeouts[1971:1985]), type= "both", p=2)
+ASE15_Preds <- predict(ASE15_Var_Fit, n.ahead = 15)
+ASE_Var15 <- mean((Final$h_avgScore[1971:1985] - ASE15_Preds$fcst$score[,1])^2)
+ASE_Var15 #0.9073143
+
+#Plot the Real Last 15 vs the Predicted Last 15
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1971,1985,1),ASE15_Preds$fcst$score[,1]), color = "red") + xlim(1900,1995)+ labs(title = "Last 15 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+#Find ASE Last 75
+ASE75_Var_Fit <- VAR(cbind( score=Final$h_avgScore[1911:1985], hr=Final$h_avgHomerun[1911:1985], so=Final$h_avgStrikeouts[1911:1985]), type = "both", p=2)
+ASE75_Preds <- predict(ASE75_Var_Fit, n.ahead = 75)
+ASE_Var75 <- mean((Final$h_avgScore[1911:1985] - ASE75_Preds$fcst$score[,1])^2)
+ASE_Var75 #0.947082
+
+#Plot the Real Last 75 vs the Predicted Last 75
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1911,1985,1),ASE75_Preds$fcst$score[,1]), color = "red") + xlim(1900,1985)+ labs(title = "Last 75 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+#Rolling Window ASE
+training_size = 15
+horizon1 = 15
+ASEHolder_VAR=numeric()
+
+for(i in 1:(length(Final$h_avgScore)-(training_size + horizon1) + 1))
+{
+  ASE_VAR.1 = mean((Final$h_avgScore[(training_size+i):(training_size+i+(horizon1)-1)]-ASE15_Preds$fcst$score[,1])^2)
+  
+  ASEHolder_VAR[i] = ASE_VAR.1
+  if(i == length(Final$h_avgScore))
+  {
+    print(ASE15_Preds$fcst$score[,1])
+  }
+  
+}
+hist(ASEHolder_VAR)
+WindowedASE_VAR= mean(ASEHolder_VAR)
+WindowedASE_VAR #0.9963616
+
+
+#Predict Next 10 Games
+  
+pred_VAR10<- predict(varfit, n.ahead = 10)
+pred_VAR10
+plot(pred_VAR10$fcst$score[,1], type = "l", ylab="Predicted Average Home Team Runs Scored", main = "Next 10 Games")
+  
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1986,1995,1),pred_VAR10$fcst$score[,1]), color = "red") + xlim(1900,1995)+ labs(title = "Next 10 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+
+#Predict Next 100 Games
+pred_VAR100<- predict(varfit, n.ahead = 100)
+pred_VAR100
+plot(pred_VAR100$fcst$score[,1], type = "l", ylab="Predicted Average Home Team Runs Scored", main = "Next 100 Games")
+  
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1986,2085,1),pred_VAR100$fcst$score[,1]), color = "red") + xlim(1900,2085) + labs(title = "Next 100 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+```
+
+# Neural Network Univariate
+Due to run time restrictions and processing power needs I chose to only do a univariate neural network model instead of a multivariate one. This model takes the data and sends it through hidden nodes to get prediction. These hidden nodes perform whats called activation functions, which apply modeling techniques to the data and output the results. I first created 3 different time series objects. One for future forecasting and the others for finding the proper ASE. I then modeled the data on the first object and used this model for finding both 15 and 75 game ASE which were 2.194383, 2.375744 respectively. These ASE are much higher than the multivariate ARIMA models, and I have no doubt that if the other 2 predictors were included in the model I would see improvement. Forecasting we can see that short term the predictions look plausible and usable. However, when we forecasted long term we get predictions that are negative which is not a plausible score in a baseball game.
+
+```{r Neural Network Run 1, message=FALSE, warning=FALSE, paged.print=TRUE,include=TRUE, results='hide'}
+#create response variable
+scr <- ts(Final$h_avgScore, frequency = 180)
+scr15 <- ts(Final$h_avgScore[1:1971], frequency = 180)
+scr75 <- ts(Final$h_avgScore[1:1911], frequency = 180)
+set.seed(2)
+scrFit <- mlp(scr, reps = 5, hd = 10)
+scrFit15 <- mlp(scr15, reps = 5, hd = 10, model = scrFit)
+scrFit75 <- mlp(scr75, reps = 5, hd = 10, model = scrFit)
+scrFit
+plot(scrFit)
+
+
+#Find ASE of Last 15 games
+NN_scr_ASE_15_fit <- forecast(scrFit15, h = 15)
+NN_scr_ASE15 <- mean((Final$h_avgScore[1975:1985] - NN_scr_ASE_15_fit$mean)^2)
+NN_scr_ASE15 #2.194383
+
+#Plot the Real Last 15 vs the Predicted Last 15
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1971,1985,1),NN_scr_ASE_15_fit$mean), color = "red") + xlim(1900,1995)+ labs(title = "Last 15 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+
+#Find ASE of Last 75 games
+NN_scr_ASE_75_fit <- forecast(scrFit75, h = 75)
+NN_scr_ASE75 <- mean((Final$h_avgScore[1911:1985] - NN_scr_ASE_75_fit$mean)^2)
+NN_scr_ASE75 #2.375744
+
+#Plot the Real Last 75 vs the Predicted Last 75
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1911,1985,1),NN_scr_ASE_75_fit$mean), color = "red") + xlim(1900,1985)+ labs(title = "Last 75 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+#Predict Next 10 Games
+NN_scr_Fore_10_Fit <- forecast(scrFit, h = 10)
+NN_scr_Fore_10_Fit
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1986,1995,1),NN_scr_Fore_10_Fit$mean), color = "red") + xlim(1900,1995)+ labs(title = "Next 10 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+
+#Predict Next 100 Games
+NN_scr_Fore_100_Fit <- forecast(scrFit, h = 100)
+NN_scr_Fore_100_Fit
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1986,2085,1),NN_scr_Fore_100_Fit$mean), color = "red") + xlim(1900,2085) + labs(title = "Next 100 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+```
+
+
+
+# Ensemble
+I finally created an ensemble model or a model comprised of multiple models. I chose to use a sinusoidal model as my base model as there was evidence that the seasonality in the runs scored could be fit with a cosine function. After fitting this function, I looked at the residuals and decided that I could possibly make it better if I fit them in another model. Hoping to improve my VAR performance I used it to model the residual points. This had less than desirable results as all of my forecasts came in below 0 which is not a number that is possible to score in baseball. This resulted in the highest ASE scores of all my models. This model really does not provide me much use as it is not accurate at all.
+
+```{r Ensamble Run 1, message=FALSE, warning=FALSE, paged.print=TRUE,include=TRUE, results='hide'}
+xc <- cos(2*pi*Final$t/180)
+fit.lm <- lm(Final$h_avgScore~xc)
+fit.en <- fitted(fit.lm)
+pred.en <- predict(fit.lm, newdata = data.frame(time = Final$t))
+
+
+plot(Final$h_avgScore ~ Final$t)
+lines(fit.en, col="red")
+
+en.reds <- fit.lm$residuals
+plotts.sample.wge(en.reds, arlimits = T)
+
+#Use a VAR model on the 
+VARselect(cbind(en.reds, Final$h_avgHomerun, Final$h_avgStrikeouts), type = "both") #p=2
+en.var_fit <- VAR(cbind(scr = en.reds, hr = Final$h_avgHomerun, so = Final$h_avgStrikeouts), type = "both", p=2)
+en_aic <- AIC(en.var_fit) #10697.41
+
+en.var_fit15 <- VAR(cbind(scr = en.reds[1:1971], hr = Final$h_avgHomerun[1:1971], so = Final$h_avgStrikeouts[1:1971]), type = "both", p=2)
+en.var_fit75 <- VAR(cbind(scr = en.reds[1:1911], hr = Final$h_avgHomerun[1:1911], so = Final$h_avgStrikeouts[1:1911]), type = "both", p=2)
+
+#Find ASE Last 15
+en.var15 <- predict(en.var_fit15, n.ahead = 15)
+en.var15_ASE <- mean((en.var15$fcst$scr[,1] - Final$h_avgScore)^2)
+en.var15_ASE #24.80422
+
+#Plot the Real Last 15 vs the Predicted Last 15
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1971,1985,1),en.var15$fcst$scr[,1]), color = "red") + xlim(1900,1995)+ labs(title = "Last 15 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+
+#Find ASE Last 75
+en.var75 <- predict(en.var_fit75, n.ahead = 75)
+en.var75_ASE <- mean((en.var75$fcst$scr[,1] - Final$h_avgScore)^2)
+en.var75_ASE #25.38977
+
+#Plot the Real Last 75 vs the Predicted Last 75
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1911,1985,1),en.var75$fcst$scr[,1]), color = "red") + xlim(1900,1985)+ labs(title = "Last 75 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+#Rolling Window ASE
+training_size = 15
+horizon1 = 15
+ASEHolder_en=numeric()
+
+for(i in 1:(length(Final$h_avgScore)-(training_size + horizon1) + 1))
+{
+  ASE_en = mean((Final$h_avgScore[(training_size+i):(training_size+i+(horizon1)-1)]-en.var75$fcst$scr[,1])^2)
+  
+  ASEHolder_en[i] = ASE_en
+  if(i == length(Final$h_avgScore))
+  {
+    print(en.var15$fcst$scr[,1])
+  }
+  
+}
+hist(ASEHolder_en)
+WindowedASE_en= mean(ASEHolder_en)
+WindowedASE_en #25.31262
+
+
+#Predict Next 10 Games
+en.var10 <- predict(en.var_fit, n.ahead = 10)
+plot(en.var10$fcst$scr[,1])
+  
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(x = seq(1986,1995,1),y = en.var10$fcst$scr[,1]), color = "red") + xlim(1900,1995)+ labs(title = "Next 10 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+
+
+#Predict Next 100 Games
+en.var100 <- predict(en.var_fit, n.ahead = 100)
+plot(en.var100$fcst$scr[,1])
+
+ggplot() + geom_line(data = Final, aes(seq(1,1985,1),h_avgScore)) + geom_line(aes(seq(1986,2085,1),en.var100$fcst$scr[,1]), color = "red") + xlim(1900,2085) + labs(title = "Next 100 Games Home Team Runs Scored Forecast", y="Average Home Team Runs Scored", x="Number of Games")
+```
+
+# Final ASE Table with best model of each type
+```{r Final ASE Table, message=FALSE, warning=FALSE, paged.print=TRUE}
+Final_Table <- matrix(c(ASE1, ASE1Long, WindowedASE1, univariate, 
+                        ASE1.2, ASE1.2Long, WindowedASE1.2, arima_no_time,
+                        ASE_Var15, ASE_Var75, WindowedASE_VAR, var_aic,
+                        NN_scr_ASE15, NN_scr_ASE75, "NA", "NA",
+                        en.var15_ASE, en.var75_ASE, WindowedASE_en, en_aic),ncol=4, byrow=T)
+colnames(Final_Table) <- c("15 Game ASE", "75 Game ASE", "Rolling Window ASE", "AIC")
+rownames(Final_Table) <- c("Univariate ARIMA", "Multivariate ARIMA", "VAR", "Univariate Neural Network", "Ensemble")
+Final_Table <- as.data.frame(Final_Table)
+Final_Table
+```
+
+# Conclusion
+I found out a lot about my data. Some models like my ARIMA models worked really well with this data, while others like the VAR did not. I found that my best 2 models were my ARIMA(1,0,1) S=180 multivariate model and my Neural Network model. I feel that if I were to introduce the homeruns and strikeouts predictors into the Neural Network model; along with hypertuning the parameters, I would see an significant increase in performance. For future forecasting I would use my Multivariate ARIMA model for long and short term forecasts.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
